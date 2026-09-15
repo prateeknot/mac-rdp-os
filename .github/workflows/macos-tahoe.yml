@@ -9,31 +9,30 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Show macOS information
+      - name: Show macOS details
         shell: bash
         run: |
           set -e
 
-          echo "======================================"
-          echo "macOS INFORMATION"
-          echo "======================================"
+          echo "========================================"
+          echo "macOS"
+          echo "========================================"
           sw_vers
           echo
 
-          echo "USER:"
+          echo "========================================"
+          echo "USER"
+          echo "========================================"
           whoami
+          id
           echo
 
-          echo "UID:"
-          id -u
-          echo
-
-          echo "HOME:"
-          echo "$HOME"
-          echo
-
-          echo "DISPLAY:"
-          echo "${DISPLAY:-<empty>}"
+          echo "========================================"
+          echo "GUI SESSION"
+          echo "========================================"
+          echo "HOME=$HOME"
+          echo "USER=$USER"
+          echo "DISPLAY=${DISPLAY:-<empty>}"
           echo
 
       - name: Connect runner to Tailscale
@@ -60,7 +59,7 @@ jobs:
             https://github.com/grioghar/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
             -o "$BIN_DIR/macos-rdp-daemon"
 
-          chmod +x "$BIN_DIR/macos-rdp-daemon"
+          chmod 755 "$BIN_DIR/macos-rdp-daemon"
 
           echo
           echo "Binary:"
@@ -70,15 +69,15 @@ jobs:
           echo "Binary type:"
           file "$BIN_DIR/macos-rdp-daemon"
 
-      - name: Create RDP TLS certificate
+      - name: Create RDP certificate
         shell: bash
         run: |
           set -euo pipefail
 
           RDP_HOME="$HOME/.macos-rdp"
 
-          if [[ ! -f "$RDP_HOME/server.crt" || ! -f "$RDP_HOME/server.key" ]]; then
-            echo "Creating TLS certificate..."
+          if [ ! -f "$RDP_HOME/server.crt" ] || [ ! -f "$RDP_HOME/server.key" ]; then
+            echo "Creating RDP TLS certificate..."
 
             openssl req \
               -x509 \
@@ -94,11 +93,9 @@ jobs:
           fi
 
           echo
-          echo "Certificate created:"
-          ls -lh "$RDP_HOME/server.crt"
-          ls -lh "$RDP_HOME/server.key"
+          echo "Certificate ready."
 
-      - name: Start RDP server through Terminal.app
+      - name: Create GUI startup script
         shell: bash
         run: |
           set -euo pipefail
@@ -107,30 +104,63 @@ jobs:
           BIN="$RDP_HOME/bin/macos-rdp-daemon"
           LOG="$RDP_HOME/logs/rdp.log"
           PIDFILE="$RDP_HOME/rdp.pid"
+          START_SCRIPT="$RDP_HOME/start-rdp.sh"
+
+          cat > "$START_SCRIPT" <<EOF
+#!/bin/bash
+
+export RDP_CERT_DIR="$RDP_HOME"
+export RDP_LOG_LEVEL="verbose"
+
+nohup "$BIN" \
+  --port 3389 \
+  --log-level verbose \
+  >> "$LOG" 2>&1 &
+
+echo \$! > "$PIDFILE"
+EOF
+
+          chmod 755 "$START_SCRIPT"
+
+          echo "Startup script created:"
+          cat "$START_SCRIPT"
+
+      - name: Start RDP server in Terminal.app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RDP_HOME="$HOME/.macos-rdp"
+          START_SCRIPT="$RDP_HOME/start-rdp.sh"
+          LOG="$RDP_HOME/logs/rdp.log"
+          PIDFILE="$RDP_HOME/rdp.pid"
 
           rm -f "$PIDFILE"
 
-          echo "Starting macOS RDP server through Terminal.app..."
+          echo "Opening Terminal.app..."
 
-          osascript <<EOF
-          tell application "Terminal"
-              activate
+          /usr/bin/osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "bash '$START_SCRIPT'"
+end tell
+EOF
 
-              do script "export RDP_CERT_DIR='$RDP_HOME'; export RDP_LOG_LEVEL='verbose'; nohup '$BIN' --port 3389 --log-level verbose >> '$LOG' 2>&1 & echo \\\$! > '$PIDFILE'"
-
-          end tell
-          EOF
+          echo "Terminal command sent."
 
           echo
           echo "Waiting for RDP server..."
 
-          for i in {1..30}; do
-            if [[ -f "$PIDFILE" ]]; then
+          FOUND="no"
+
+          for i in $(seq 1 30); do
+            if [ -f "$PIDFILE" ]; then
               PID="$(cat "$PIDFILE" 2>/dev/null || true)"
 
-              if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-                echo "RDP server started."
-                echo "PID: $PID"
+              if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                echo "RDP server is running."
+                echo "PID=$PID"
+                FOUND="yes"
                 break
               fi
             fi
@@ -139,60 +169,95 @@ jobs:
           done
 
           echo
-          echo "======================================"
-          echo "RDP PROCESS"
-          echo "======================================"
 
-          ps aux | grep '[m]acos-rdp-daemon' || true
+          if [ "$FOUND" != "yes" ]; then
+            echo "RDP server did not start."
 
-          echo
-          echo "======================================"
-          echo "PORT 3389"
-          echo "======================================"
+            echo
+            echo "===== PROCESS ====="
+            ps aux | grep '[m]acos-rdp-daemon' || true
+
+            echo
+            echo "===== LOG ====="
+            cat "$LOG" 2>/dev/null || true
+
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "RDP LISTENER"
+          echo "========================================"
 
           lsof -nP -iTCP:3389 -sTCP:LISTEN || true
 
           echo
-          echo "======================================"
+          echo "========================================"
           echo "RDP LOG"
-          echo "======================================"
+          echo "========================================"
 
-          cat "$LOG" 2>/dev/null || true
+          tail -n 50 "$LOG" 2>/dev/null || true
 
-      - name: Show Tailscale IP and connection info
+      - name: Show Tailscale connection information
         shell: bash
         run: |
           set -e
 
           echo
-          echo "======================================"
+          echo "========================================"
           echo "TAILSCALE STATUS"
-          echo "======================================"
+          echo "========================================"
 
           tailscale status || true
 
           echo
-          echo "======================================"
+          echo "========================================"
           echo "TAILSCALE IPv4"
-          echo "======================================"
+          echo "========================================"
 
           TSIP="$(tailscale ip -4 | head -n 1 || true)"
+
           echo "$TSIP"
 
           echo
-          echo "======================================"
-          echo "WINDOWS RDP CONNECTION"
-          echo "======================================"
+          echo "========================================"
+          echo "WINDOWS RDP"
+          echo "========================================"
 
-          echo "Use Windows Remote Desktop (mstsc)"
+          echo "Open Windows Remote Desktop (mstsc)"
           echo
           echo "Computer:"
           echo "${TSIP}:3389"
           echo
 
-          echo "Keep this GitHub Actions workflow running."
+      - name: Verify RDP server
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Keep remote Mac alive for 4 hours
+          RDP_HOME="$HOME/.macos-rdp"
+          LOG="$RDP_HOME/logs/rdp.log"
+
+          echo "Waiting 5 seconds for final startup..."
+          sleep 5
+
+          echo
+          echo "========================================"
+          echo "FINAL RDP CHECK"
+          echo "========================================"
+
+          ps aux | grep '[m]acos-rdp-daemon' || true
+
+          echo
+          lsof -nP -iTCP:3389 -sTCP:LISTEN || true
+
+          echo
+          echo "========================================"
+          echo "RECENT LOG"
+          echo "========================================"
+
+          tail -n 100 "$LOG" 2>/dev/null || true
+
+      - name: Keep macOS session alive for 4 hours
         shell: bash
         run: |
           set -u
@@ -201,14 +266,16 @@ jobs:
           LOG="$RDP_HOME/logs/rdp.log"
 
           echo
-          echo "======================================"
+          echo "========================================"
           echo "REMOTE MAC IS ACTIVE"
-          echo "======================================"
+          echo "========================================"
+          echo "Session duration: 4 hours"
+          echo "Do not stop this GitHub Actions run."
+          echo
 
           END_TIME=$((SECONDS + 14400))
 
-          while (( SECONDS < END_TIME )); do
-
+          while [ "$SECONDS" -lt "$END_TIME" ]; do
             echo
             echo "===== $(date) ====="
 
@@ -222,8 +289,9 @@ jobs:
             tail -n 20 "$LOG" 2>/dev/null || true
 
             sleep 30
-
           done
 
           echo
-          echo "4-hour session finished."
+          echo "========================================"
+          echo "4-HOUR SESSION FINISHED"
+          echo "========================================"
