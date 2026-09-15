@@ -1,0 +1,229 @@
+name: macOS Tahoe Remote Desktop
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-remote:
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    steps:
+      - name: Show macOS information
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "macOS INFORMATION"
+          echo "======================================"
+          sw_vers
+          echo
+
+          echo "USER:"
+          whoami
+          echo
+
+          echo "UID:"
+          id -u
+          echo
+
+          echo "HOME:"
+          echo "$HOME"
+          echo
+
+          echo "DISPLAY:"
+          echo "${DISPLAY:-<empty>}"
+          echo
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          tags: tag:ci
+
+      - name: Download macOS RDP server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RDP_HOME="$HOME/.macos-rdp"
+          BIN_DIR="$RDP_HOME/bin"
+          LOG_DIR="$RDP_HOME/logs"
+
+          mkdir -p "$BIN_DIR"
+          mkdir -p "$LOG_DIR"
+
+          echo "Downloading macos-rdp-daemon..."
+
+          curl -fL \
+            https://github.com/grioghar/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
+            -o "$BIN_DIR/macos-rdp-daemon"
+
+          chmod +x "$BIN_DIR/macos-rdp-daemon"
+
+          echo
+          echo "Binary:"
+          ls -lh "$BIN_DIR/macos-rdp-daemon"
+
+          echo
+          echo "Binary type:"
+          file "$BIN_DIR/macos-rdp-daemon"
+
+      - name: Create RDP TLS certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RDP_HOME="$HOME/.macos-rdp"
+
+          if [[ ! -f "$RDP_HOME/server.crt" || ! -f "$RDP_HOME/server.key" ]]; then
+            echo "Creating TLS certificate..."
+
+            openssl req \
+              -x509 \
+              -newkey rsa:2048 \
+              -sha256 \
+              -nodes \
+              -days 3650 \
+              -keyout "$RDP_HOME/server.key" \
+              -out "$RDP_HOME/server.crt" \
+              -subj "/CN=macos-tahoe"
+
+            chmod 600 "$RDP_HOME/server.key"
+          fi
+
+          echo
+          echo "Certificate created:"
+          ls -lh "$RDP_HOME/server.crt"
+          ls -lh "$RDP_HOME/server.key"
+
+      - name: Start RDP server through Terminal.app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RDP_HOME="$HOME/.macos-rdp"
+          BIN="$RDP_HOME/bin/macos-rdp-daemon"
+          LOG="$RDP_HOME/logs/rdp.log"
+          PIDFILE="$RDP_HOME/rdp.pid"
+
+          rm -f "$PIDFILE"
+
+          echo "Starting macOS RDP server through Terminal.app..."
+
+          osascript <<EOF
+          tell application "Terminal"
+              activate
+
+              do script "export RDP_CERT_DIR='$RDP_HOME'; export RDP_LOG_LEVEL='verbose'; nohup '$BIN' --port 3389 --log-level verbose >> '$LOG' 2>&1 & echo \\\$! > '$PIDFILE'"
+
+          end tell
+          EOF
+
+          echo
+          echo "Waiting for RDP server..."
+
+          for i in {1..30}; do
+            if [[ -f "$PIDFILE" ]]; then
+              PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+
+              if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+                echo "RDP server started."
+                echo "PID: $PID"
+                break
+              fi
+            fi
+
+            sleep 1
+          done
+
+          echo
+          echo "======================================"
+          echo "RDP PROCESS"
+          echo "======================================"
+
+          ps aux | grep '[m]acos-rdp-daemon' || true
+
+          echo
+          echo "======================================"
+          echo "PORT 3389"
+          echo "======================================"
+
+          lsof -nP -iTCP:3389 -sTCP:LISTEN || true
+
+          echo
+          echo "======================================"
+          echo "RDP LOG"
+          echo "======================================"
+
+          cat "$LOG" 2>/dev/null || true
+
+      - name: Show Tailscale IP and connection info
+        shell: bash
+        run: |
+          set -e
+
+          echo
+          echo "======================================"
+          echo "TAILSCALE STATUS"
+          echo "======================================"
+
+          tailscale status || true
+
+          echo
+          echo "======================================"
+          echo "TAILSCALE IPv4"
+          echo "======================================"
+
+          TSIP="$(tailscale ip -4 | head -n 1 || true)"
+          echo "$TSIP"
+
+          echo
+          echo "======================================"
+          echo "WINDOWS RDP CONNECTION"
+          echo "======================================"
+
+          echo "Use Windows Remote Desktop (mstsc)"
+          echo
+          echo "Computer:"
+          echo "${TSIP}:3389"
+          echo
+
+          echo "Keep this GitHub Actions workflow running."
+
+      - name: Keep remote Mac alive for 4 hours
+        shell: bash
+        run: |
+          set -u
+
+          RDP_HOME="$HOME/.macos-rdp"
+          LOG="$RDP_HOME/logs/rdp.log"
+
+          echo
+          echo "======================================"
+          echo "REMOTE MAC IS ACTIVE"
+          echo "======================================"
+
+          END_TIME=$((SECONDS + 14400))
+
+          while (( SECONDS < END_TIME )); do
+
+            echo
+            echo "===== $(date) ====="
+
+            echo "--- RDP process ---"
+            ps aux | grep '[m]acos-rdp-daemon' || true
+
+            echo "--- Port 3389 ---"
+            lsof -nP -iTCP:3389 -sTCP:LISTEN || true
+
+            echo "--- Recent RDP log ---"
+            tail -n 20 "$LOG" 2>/dev/null || true
+
+            sleep 30
+
+          done
+
+          echo
+          echo "4-hour session finished."
